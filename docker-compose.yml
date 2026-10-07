@@ -1,0 +1,96 @@
+x-app-env: &app-env
+  DATABASE_URL: postgresql+asyncpg://payments:payments@postgres:5432/payments
+  RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+  API_KEY: ${API_KEY:-secret-api-key}
+  WEBHOOK_SECRET: ${WEBHOOK_SECRET:-}
+  MAX_ATTEMPTS: ${MAX_ATTEMPTS:-3}
+  RETRY_BASE_DELAY: ${RETRY_BASE_DELAY:-2}
+  RETRY_BACKOFF_FACTOR: ${RETRY_BACKOFF_FACTOR:-2}
+  GATEWAY_MIN_DELAY: ${GATEWAY_MIN_DELAY:-2}
+  GATEWAY_MAX_DELAY: ${GATEWAY_MAX_DELAY:-5}
+  GATEWAY_SUCCESS_RATE: ${GATEWAY_SUCCESS_RATE:-0.9}
+  WEBHOOK_TIMEOUT: ${WEBHOOK_TIMEOUT:-5}
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+x-app-image: &app-image
+  build: .
+  environment: *app-env
+  restart: unless-stopped
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: payments
+      POSTGRES_PASSWORD: payments
+      POSTGRES_DB: payments
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U payments -d payments"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    ports:
+      - "${RABBITMQ_PORT:-5672}:5672"
+      - "${RABBITMQ_UI_PORT:-15672}:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_port_connectivity"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  migrate:
+    <<: *app-image
+    restart: "no"
+    command: alembic upgrade head
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    <<: *app-image
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    ports:
+      - "${API_PORT:-8000}:8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  outbox-relay:
+    <<: *app-image
+    command: python -m app.outbox.relay
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+
+  consumer:
+    <<: *app-image
+    command: faststream run app.consumer.app:app
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+
+  # Demo-only: receives webhooks so the whole flow can be observed locally.
+  webhook-receiver:
+    <<: *app-image
+    command: uvicorn tools.webhook_receiver:app --host 0.0.0.0 --port 9000
+    ports:
+      - "${WEBHOOK_RECEIVER_PORT:-9000}:9000"
+
+volumes:
+  pgdata:
